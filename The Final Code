@@ -1,0 +1,592 @@
+#https://colab.research.google.com/drive/1Td9yzbCsIFWxDIa-RYYr1IkqZYuu7aD1?usp=sharing
+#----You can use the above link for the collab file access.----------
+!pip install -q librosa matplotlib tensorflow pandas scikit-learn soundfile noisereduce
+!mkdir -p data/veena data/guitar data/augmented
+
+# ==============================
+# Import Libraries
+# ==============================
+import numpy as np
+import pandas as pd
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import noisereduce as nr
+import soundfile as sf
+import os
+import glob
+import random
+import zipfile
+import io
+import shutil
+from IPython.display import Audio, display
+from google.colab import files
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras import layers, models, callbacks
+import tensorflow as tf
+import ipywidgets as widgets
+from IPython.display import clear_output
+
+# ==============================
+# Configuration
+# ==============================
+class Config:
+    SR = 22050          # Sample rate
+    DURATION = 3        # Seconds per sample
+    N_MFCC = 40         # MFCC coefficients
+    HOP_LENGTH = 512    # STFT hop length
+    N_FFT = 2048        # FFT window size
+    MAX_PAD_LEN = 130   # Max MFCC features
+    TEST_SIZE = 0.2     # Validation split
+    BATCH_SIZE = 32     # Training batch size
+    EPOCHS = 100        # Max training epochs
+    PATIENCE = 10       # Early stopping patience
+
+# Set random seeds
+np.random.seed(42)
+tf.random.set_seed(42)
+random.seed(42)
+
+# %% [Dataset Handling]
+# ==============================
+# Dataset Loader
+# ==============================
+class DatasetManager:
+    """Handles dataset upload and preparation"""
+
+    def __init__(self):
+        self.instruments = ['veena', 'guitar']
+        self.create_dirs()
+
+    def create_dirs(self):
+        """Create required directory structure"""
+        for inst in self.instruments:
+            os.makedirs(f"data/{inst}", exist_ok=True)
+            os.makedirs(f"data/augmented/{inst}", exist_ok=True)
+
+    def upload_datasets(self):
+        """Guide user through dataset upload process"""
+        print("""
+        ==============================
+        DATASET UPLOAD INSTRUCTIONS:
+        1. Prepare two ZIP files:
+           - 'veena_samples.zip' with .wav files
+           - 'guitar_samples.zip' with .wav files
+        2. Upload when prompted
+        3. Files will be automatically organized
+        ==============================
+        """)
+
+        success = True
+        for inst in self.instruments:
+            print(f"\n▶▶ Upload {inst.upper()} samples:")
+            uploaded = files.upload()
+
+            if not uploaded:
+                print(f"⚠️ No files uploaded for {inst}")
+                success = False
+                continue
+
+            zip_name = next(iter(uploaded))
+            dest_dir = f"data/{inst}"
+
+            # Clear existing files
+            for f in glob.glob(f"{dest_dir}/*.wav"):
+                os.remove(f)
+
+            # Handle ZIP upload
+            if zip_name.endswith('.zip'):
+                with zipfile.ZipFile(io.BytesIO(uploaded[zip_name]), 'r') as zip_ref:
+                    zip_ref.extractall(dest_dir)
+                print(f" Extracted {inst} samples")
+            else:
+                with open(os.path.join(dest_dir, zip_name), 'wb') as f:
+                    f.write(uploaded[zip_name])
+                print(f"Saved {zip_name}")
+
+            # Move all WAV files to root directory
+            for wav_path in glob.glob(f"{dest_dir}/**/*.wav", recursive=True):
+                if os.path.dirname(wav_path) != dest_dir:
+                    shutil.move(wav_path, dest_dir)
+
+            # Verify upload
+            wav_count = len(glob.glob(f"{dest_dir}/*.wav"))
+            print(f"{inst.capitalize()} samples: {wav_count}")
+
+        return success
+
+# %% [Audio Preprocessing]
+# ==============================
+# Audio Preprocessor
+# ==============================
+class AudioPreprocessor:
+    """Handles audio preprocessing pipeline"""
+
+    def __init__(self):
+        self.sr = Config.SR
+        self.duration = Config.DURATION
+
+    def process_audio(self, file_path):
+        """Complete preprocessing pipeline"""
+        # Load and trim audio
+        y, _ = librosa.load(file_path, sr=self.sr)
+        y, _ = librosa.effects.trim(y, top_db=20)
+
+        # Noise reduction
+        y = self._reduce_noise(y)
+
+        # Fix duration
+        y = self._fix_duration(y)
+
+        # Normalization
+        return librosa.util.normalize(y)
+
+    def process_audio_data(self, audio_data):
+        """Process audio from bytes"""
+        y, _ = librosa.load(io.BytesIO(audio_data), sr=self.sr)
+        y, _ = librosa.effects.trim(y, top_db=20)
+        y = self._reduce_noise(y)
+        y = self._fix_duration(y)
+        return librosa.util.normalize(y)
+
+    def _reduce_noise(self, audio):
+        """Advanced noise reduction"""
+        noise_sample = audio[:int(self.sr*0.5)]  # First 0.5s as noise sample
+        return nr.reduce_noise(
+            y=audio,
+            y_noise=noise_sample,
+            sr=self.sr,
+            stationary=True,
+            prop_decrease=0.95
+        )
+
+    def _fix_duration(self, audio):
+        """Pad/trim to target duration"""
+        target_len = self.sr * self.duration
+        if len(audio) > target_len:
+            return audio[:target_len]
+        return np.pad(audio, (0, max(0, target_len - len(audio))), 'constant')
+
+# %% [Data Augmentation]
+# ==============================
+# Audio Augmenter
+# ==============================
+class AudioAugmenter:
+    """Handles data augmentation for balancing"""
+
+    def __init__(self):
+        self.sr = Config.SR
+        self.aug_methods = [
+            self.time_stretch,
+            self.pitch_shift,
+            self.add_noise,
+            self.time_shift,
+            self.voltage_shift
+        ]
+
+    def balance_dataset(self, file_paths, target_count):
+        """Balance dataset through augmentation"""
+        augmented = []
+        while len(augmented) < target_count:
+            for path in file_paths:
+                if len(augmented) >= target_count:
+                    break
+                audio = librosa.load(path, sr=self.sr)[0]
+                aug_audio = self.apply_random_augmentation(audio)
+                augmented.append(aug_audio)
+        return augmented
+
+    def apply_random_augmentation(self, audio):
+        """Apply random augmentation technique"""
+        method = random.choice(self.aug_methods)
+        return method(audio)
+
+    def time_stretch(self, audio):
+        rate = random.uniform(0.8, 1.2)
+        return librosa.effects.time_stretch(audio, rate=rate)
+
+    def pitch_shift(self, audio):
+        steps = random.uniform(-4, 4)
+        return librosa.effects.pitch_shift(audio, sr=self.sr, n_steps=steps)
+
+    def add_noise(self, audio):
+        noise = np.random.normal(0, 0.005, audio.shape)
+        return audio + noise
+
+    def time_shift(self, audio):
+        shift = random.randint(0, len(audio)//2)
+        return np.roll(audio, shift)
+
+    def voltage_shift(self, audio):
+        return audio * random.uniform(0.5, 1.5)
+
+# %% [Feature Extraction]
+# ==============================
+# Feature Extractor
+# ==============================
+class FeatureEngineer:
+    """Handles feature extraction and processing"""
+
+    def __init__(self):
+        self.scaler = StandardScaler()
+
+    def extract_features(self, audio):
+        """Extract and process MFCC features"""
+        mfcc = librosa.feature.mfcc(
+            y=audio,
+            sr=Config.SR,
+            n_mfcc=Config.N_MFCC,
+            hop_length=Config.HOP_LENGTH,
+            n_fft=Config.N_FFT
+        )
+
+        # Padding/Truncating
+        pad_width = Config.MAX_PAD_LEN - mfcc.shape[1]
+        if pad_width < 0:
+            mfcc = mfcc[:, :Config.MAX_PAD_LEN]
+        else:
+            mfcc = np.pad(mfcc, ((0,0), (0,pad_width)), 'constant')
+
+        # Reshape for CNN
+        return mfcc.reshape((Config.N_MFCC, Config.MAX_PAD_LEN, 1))
+
+    def normalize_features(self, features):
+        """Normalize feature array"""
+        original_shape = features.shape
+        flattened = features.reshape(-1, original_shape[-1])
+        normalized = self.scaler.fit_transform(flattened)
+        return normalized.reshape(original_shape)
+
+# %% [Model Architecture]
+# ==============================
+# CNN Model Builder
+# ==============================
+class ModelBuilder:
+    """Creates and manages CNN model"""
+
+    def __init__(self):
+        self.model = self.build_model()
+
+    def build_model(self):
+        """Construct CNN architecture"""
+        model = models.Sequential([
+            layers.Input(shape=(Config.N_MFCC, Config.MAX_PAD_LEN, 1)),
+            layers.Conv2D(32, (3,3), activation='relu'),
+            layers.MaxPooling2D((2,2)),
+            layers.Conv2D(64, (3,3), activation='relu'),
+            layers.MaxPooling2D((2,2)),
+            layers.Dropout(0.25),
+            layers.Flatten(),
+            layers.Dense(128, activation='relu'),
+            layers.Dropout(0.5),
+            layers.Dense(1, activation='sigmoid')
+        ])
+
+        model.compile(
+            optimizer='adam',
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        return model
+
+# %% [Instrument Tuner]
+# ==============================
+# Instrument Tuner Component
+# ==============================
+class InstrumentTuner:
+    """Handles tuning analysis after classification"""
+
+    def __init__(self):
+        self.tunings = {
+            'veena': {
+                'Standard': [65.41, 98.00, 130.81, 196.00, 261.63, 98.00],
+                'Notes': ['Sa (C2)', 'Pa (G2)', 'Sa (C3)', 'Pa (G3)', 'Sa (C4)', 'Pa (G2)']
+            },
+            'guitar': {
+                'Standard': [82.41, 110.00, 146.83, 196.00, 246.94, 329.63],
+                'Notes': ['E2', 'A2', 'D3', 'G3', 'B3', 'E4']
+            }
+        }
+        self.sample_rate = Config.SR
+        self.tolerance = 5  # cents
+
+    def cents_diff(self, freq1, freq2):
+        """Calculate cents difference between two frequencies"""
+        return 1200 * np.log2(freq1/freq2) if freq1 and freq2 else 0
+
+    def find_closest_note(self, frequency, instrument):
+        """Find closest note in current tuning"""
+        notes = self.tunings[instrument]['Standard']
+        closest = min(notes, key=lambda x: abs(np.log2(x/frequency)))
+        return closest, notes.index(closest)
+
+    def analyze_audio(self, audio_data, instrument):
+        """Analyze preprocessed audio data"""
+        try:
+            # Detect fundamental frequency using YIN algorithm
+            f0 = librosa.yin(audio_data, fmin=50, fmax=350, sr=self.sample_rate)
+            valid_f0 = f0[f0 > 0]
+            if len(valid_f0) == 0:
+                return None  # No pitch detected
+            
+            f0 = np.median(valid_f0)
+
+            # Find closest note
+            target_freq, note_idx = self.find_closest_note(f0, instrument)
+            note_name = self.tunings[instrument]['Notes'][note_idx]
+
+            # Calculate tuning parameters
+            cents = self.cents_diff(f0, target_freq)
+            freq_diff = f0 - target_freq
+
+            return {
+                'detected_freq': f0,
+                'target_freq': target_freq,
+                'cents_diff': cents,
+                'freq_diff': freq_diff,
+                'note_name': note_name,
+                'note_number': note_idx+1
+            }
+        except Exception as e:
+            print(f"Tuning analysis error: {str(e)}")
+            return None
+
+# %% [Main Workflow]
+# ==============================
+# Complete System
+# ==============================
+class InstrumentClassifier:
+    """End-to-end classification and tuning system"""
+
+    def __init__(self):
+        self.data_manager = DatasetManager()
+        self.preprocessor = AudioPreprocessor()
+        self.augmenter = AudioAugmenter()
+        self.feature_engineer = FeatureEngineer()
+        self.model = ModelBuilder().model
+        self.tuner = InstrumentTuner()
+        self.upload_widget = None
+        self.output_widget = None
+
+    def run(self):
+        """Execute complete workflow"""
+        # Dataset setup
+        if not self.data_manager.upload_datasets():
+            return
+
+        # Load and balance data
+        file_paths, labels = self.load_dataset()
+        features, labels = self.process_dataset(file_paths, labels)
+
+        # Train model
+        self.train_model(features, labels)
+
+        # Launch prediction interface
+        self.create_prediction_interface()
+
+    def load_dataset(self):
+        """Load and balance raw dataset"""
+        print("\n Analyzing dataset balance...")
+        veena_files = glob.glob("data/veena/*.wav")
+        guitar_files = glob.glob("data/guitar/*.wav")
+
+        # Balance classes through augmentation
+        if len(veena_files) != len(guitar_files):
+            print("Balancing dataset through augmentation...")
+            minority = 'veena' if len(veena_files) < len(guitar_files) else 'guitar'
+            target_count = max(len(veena_files), len(guitar_files))
+
+            augmented = self.augmenter.balance_dataset(
+                glob.glob(f"data/{minority}/*.wav"),
+                target_count - len(glob.glob(f"data/{minority}/*.wav"))
+            )
+
+            # Save augmented files
+            aug_dir = f"data/augmented/{minority}"
+            for i, audio in enumerate(augmented):
+                sf.write(f"{aug_dir}/aug_{i}.wav", audio, Config.SR)
+
+            # Update file lists
+            if minority == 'veena':
+                veena_files += glob.glob(f"{aug_dir}/*.wav")
+            else:
+                guitar_files += glob.glob(f"{aug_dir}/*.wav")
+
+        # Prepare final dataset
+        file_paths = veena_files + guitar_files
+        labels = [0]*len(veena_files) + [1]*len(guitar_files)
+
+        print(f"\n Final dataset balance:")
+        print(f" - Veena: {len(veena_files)} samples")
+        print(f" - Guitar: {len(guitar_files)} samples")
+
+        return file_paths, labels
+
+    def process_dataset(self, file_paths, labels):
+        """Process audio and extract features"""
+        print("\n🔧 Processing audio files...")
+        processed = [self.preprocessor.process_audio(f) for f in file_paths]
+
+        print("\n🎛 Extracting features...")
+        features = np.array([self.feature_engineer.extract_features(a) for a in processed])
+        features = self.feature_engineer.normalize_features(features)
+
+        return features, np.array(labels)
+
+    def train_model(self, features, labels):
+        """Train and evaluate model"""
+        print("\n Training model...")
+        X_train, X_test, y_train, y_test = train_test_split(
+            features, labels,
+            test_size=Config.TEST_SIZE,
+            stratify=labels,
+            random_state=42
+        )
+
+        history = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_test, y_test),
+            batch_size=Config.BATCH_SIZE,
+            epochs=Config.EPOCHS,
+            callbacks=[
+                callbacks.EarlyStopping(patience=Config.PATIENCE, restore_best_weights=True),
+                callbacks.ReduceLROnPlateau(factor=0.5, patience=5)
+            ],
+            verbose=1
+        )
+
+        # Evaluate
+        test_loss, test_acc = self.model.evaluate(X_test, y_test)
+        print(f"\n Test Accuracy: {test_acc:.2%}")
+        self.plot_training(history)
+
+    def plot_training(self, history):
+        """Plot training history"""
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1)
+        plt.plot(history.history['accuracy'], label='Train')
+        plt.plot(history.history['val_accuracy'], label='Validation')
+        plt.title('Model Accuracy')
+        plt.ylabel('Accuracy')
+        plt.xlabel('Epoch')
+        plt.legend()
+
+        plt.subplot(1, 2, 2)
+        plt.plot(history.history['loss'], label='Train')
+        plt.plot(history.history['val_loss'], label='Validation')
+        plt.title('Model Loss')
+        plt.ylabel('Loss')
+        plt.xlabel('Epoch')
+        plt.legend()
+        plt.show()
+
+    def create_prediction_interface(self):
+        """Create interactive prediction interface with widgets"""
+        print("\n Instrument Classification & Tuning System Ready!")
+        
+        # Create UI components
+        self.upload_widget = widgets.FileUpload(
+            accept='.wav,.mp3,.ogg,.flac',
+            multiple=False,
+            description='Upload Audio'
+        )
+        self.output_widget = widgets.Output()
+        
+        # Display UI
+        display(widgets.VBox([
+            widgets.HTML("<h3> Upload Audio File for Analysis:</h3>"),
+            self.upload_widget,
+            self.output_widget
+        ]))
+        
+        # Set up upload handler
+        self.upload_widget.observe(self.handle_prediction_upload, names='value')
+
+    def handle_prediction_upload(self, change):
+        """Handle audio upload for prediction and tuning"""
+        with self.output_widget:
+            clear_output()
+            
+            if not change['new']:
+                return
+                
+            try:
+                # Get uploaded file content
+                uploaded_file = list(change['new'].values())[0]
+                file_name = uploaded_file['metadata']['name']
+                audio_content = uploaded_file['content']
+                
+                # Process audio
+                processed_audio = self.preprocessor.process_audio_data(audio_content)
+                
+                # Extract features and predict
+                features = self.feature_engineer.extract_features(processed_audio)
+                features = self.feature_engineer.normalize_features(features[np.newaxis, ...])
+                prob = self.model.predict(features)[0][0]
+                instrument = 'veena' if prob < 0.5 else 'guitar'
+                confidence = (1 - prob) if prob < 0.5 else prob
+                
+                # Perform tuning analysis
+                tuning_results = self.tuner.analyze_audio(processed_audio, instrument)
+                
+                # Display results
+                self.display_results(instrument, confidence, tuning_results, processed_audio, file_name)
+                
+            except Exception as e:
+                print(f" Error processing file: {str(e)}")
+                print("Please ensure you've uploaded a valid audio file (WAV, MP3, OGG, FLAC)")
+
+    def display_results(self, instrument, confidence, tuning_results, audio, filename):
+        """Display classification and tuning results"""
+        # Classification results
+        print(f"\n Classification Results:")
+        print(f"   Instrument: {instrument.capitalize()} (Confidence: {confidence:.2%})")
+        
+        if tuning_results:
+            # Tuning results
+            print(f"\n Tuning Analysis:")
+            print(f"   Detected Frequency: {tuning_results['detected_freq']:.2f} Hz")
+            print(f"   Target Frequency:   {tuning_results['target_freq']:.2f} Hz")
+            print(f"   Note: {tuning_results['note_name']} (String {tuning_results['note_number']})")
+            
+            # Tuning feedback
+            cents_diff = tuning_results['cents_diff']
+            if abs(cents_diff) < self.tuner.tolerance:
+                print("\n Perfectly Tuned!")
+            else:
+                action = "tighten" if cents_diff < 0 else "loosen"
+                print(f"\n Needs Adjustment ({abs(cents_diff):.1f} cents deviation)")
+                print(f"Recommendation: {action.capitalize()} the string by ~{abs(tuning_results['freq_diff']):.2f} Hz")
+                
+            # Visualizations
+            self.visualize_prediction(audio, filename)
+            display(Audio(audio, rate=Config.SR))
+        else:
+            print("\n Could not detect pitch for tuning analysis")
+
+    def visualize_prediction(self, audio, file_name):
+        """Generate prediction visualizations"""
+        plt.figure(figsize=(15, 5))
+        
+        # Waveform
+        plt.subplot(1, 2, 1)
+        librosa.display.waveshow(audio, sr=Config.SR)
+        plt.title(f"Waveform: {file_name}")
+        
+        # Spectrogram
+        plt.subplot(1, 2, 2)
+        S = librosa.amplitude_to_db(np.abs(librosa.stft(audio)), ref=np.max)
+        librosa.display.specshow(S, sr=Config.SR, x_axis='time', y_axis='log')
+        plt.colorbar(format='%+2.0f dB')
+        plt.title("Spectrogram")
+        
+        plt.tight_layout()
+        plt.show()
+
+# ==============================
+# Execute System
+# ==============================
+if __name__ == "__main__":
+    classifier = InstrumentClassifier()
+    classifier.run()
