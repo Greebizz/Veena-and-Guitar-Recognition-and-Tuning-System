@@ -7,8 +7,6 @@
 
 A deep learning system for classifying Indian Veena vs Western Guitar and providing real-time tuning feedback. Combines CNNs with music signal processing for instrument recognition and pitch analysis.
 
-![System Workflow](https://via.placeholder.com/800x400.png?text=Audio+Processing+→+MFCC+Extraction+→+CNN+Classification+→+Tuning+Analysis)
-
 ## Features
 
 - **Instrument Classification**
