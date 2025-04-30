@@ -1,4 +1,4 @@
-```markdown
+
 # Instrument Classification & Tuning System
 
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.x-orange)](https://www.tensorflow.org/)
@@ -52,10 +52,6 @@ python instrument_tuner.py --train --epochs 100
   - Noise injection
   - Dynamic range compression
 
-### 2. Prediction Mode
-```bash
-python instrument_tuner.py --predict input.wav
-```
 **Output Includes:**
 1. Instrument classification with confidence
 2. Detected vs target frequency
@@ -137,9 +133,6 @@ soundfile==0.12.1
 noisereduce==0.3.0
 scikit-learn==1.2.2
 ```
-
-## License
-MIT License - See [LICENSE](LICENSE) for full text
 
 ## Acknowledgments
 - Librosa: MFCC extraction and audio analysis
